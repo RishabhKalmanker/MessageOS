@@ -1,0 +1,30 @@
+# Environment — NEVER commit secrets
+.env
+
+# Google OAuth credentials and token cache
+*.apps.googleusercontent.com.json
+token.json
+
+# SQLite database (local dev only — Render uses ephemeral disk)
+*.db
+*.db-wal
+*.db-shm
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+dist/
+build/
+
+# macOS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
+
+# Logs
+*.log
