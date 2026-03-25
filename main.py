@@ -125,11 +125,11 @@ def imessage_received(payload: IMessageReceived):
     snippet = (payload.body or "")[:80]
 
     if tier == "vip":
-        alert_vip_received(contact["name"], snippet)
+        alert_vip_received(contact["name"], snippet, contact_id=contact_id, message_id=message_id)
         open_sla_clock(message_id, contact_id)
         logger.info(f"[WEBHOOK] VIP {contact['name']} - SLA clock started")
     elif tier == "important":
-        alert_important_received(contact["name"], snippet)
+        alert_important_received(contact["name"], snippet, contact_id=contact_id, message_id=message_id)
         open_sla_clock(message_id, contact_id)
         logger.info(f"[WEBHOOK] Important {contact['name']} - SLA clock started")
     else:

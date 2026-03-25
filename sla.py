@@ -104,7 +104,12 @@ def _watchdog_tick():
         # Fire escalation alert once when warn threshold is crossed
         if elapsed >= warn_threshold and not clock["escalation_sent"]:
             logger.info(f"[SLA] Escalation for {name} — {elapsed:.1f} min elapsed")
-            alert_sla_escalation(name, int(elapsed))
+            alert_sla_escalation(
+                name,
+                int(elapsed),
+                contact_id=clock["contact_id"],
+                message_id=clock["message_id"] or 0,
+            )
             _mark_escalation_sent(clock_id)
 
         # Mark breached when breach threshold is crossed
