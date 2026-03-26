@@ -12,7 +12,7 @@ from typing import List, Optional
 from dotenv import load_dotenv
 load_dotenv()
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import PlainTextResponse, HTMLResponse
 from pydantic import BaseModel
 from thefuzz import process as fuzz_process
@@ -226,17 +226,24 @@ def _extract_contact_fields(raw: dict) -> tuple[str, str | None, str | None]:
 
 
 @app.post("/contacts/sync")
-def contacts_sync(payload: ContactsSync):
+async def contacts_sync(request: Request):
     """
     Upsert contacts from Apple Contacts (via iOS Shortcut).
-    Accepts both simple {name, phone, email} and the iOS Shortcuts nested
-    format (givenName/familyName/phoneNumbers/emailAddresses).
+    Accepts raw JSON without Pydantic validation so iOS Shortcuts payloads
+    of any shape pass through. Handles both the iOS nested format
+    (givenName/familyName/phoneNumbers/emailAddresses) and simple
+    {name, phone, email} dicts.
     Matches on phone OR email. New contacts default to Normal tier.
     Existing contacts keep their current tier.
-    Returns {"synced": N, "new": N, "updated": N}
+    Returns {"synced": N, "new": N, "updated": N, "skipped": N}
     """
-    received = len(payload.contacts)
+    body = await request.json()
+    contacts_raw = body if isinstance(body, list) else body.get("contacts", [])
+
+    received = len(contacts_raw)
     logger.info(f"[SYNC] Received {received} contacts from iOS Shortcut")
+    if contacts_raw:
+        logger.info(f"[SYNC] First contact sample: {contacts_raw[0]}")
 
     new_count = 0
     updated_count = 0
@@ -244,7 +251,7 @@ def contacts_sync(payload: ContactsSync):
     conn = get_connection()
     cur = conn.cursor()
 
-    for raw in payload.contacts:
+    for raw in contacts_raw:
         name, phone, email = _extract_contact_fields(raw)
 
         if not name:
