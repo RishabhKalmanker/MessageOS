@@ -46,14 +46,11 @@ class IMessageSent(BaseModel):
     timestamp: Optional[str] = None
 
 
-class ContactItem(BaseModel):
-    name: str
-    phone: Optional[str] = None
-    email: Optional[str] = None
-
-
 class ContactsSync(BaseModel):
-    contacts: List[ContactItem]
+    # Accept any list element — handles both the simple {name, phone, email}
+    # format and the iOS Shortcuts nested format (givenName/familyName/
+    # phoneNumbers/emailAddresses).
+    contacts: List[dict]
 
 
 class TierUpdate(BaseModel):
@@ -178,26 +175,94 @@ def contacts_list():
     return [dict(r) for r in rows]
 
 
+def _extract_contact_fields(raw: dict) -> tuple[str, str | None, str | None]:
+    """
+    Return (name, phone, email) from either format:
+
+    Simple format (our own API / manual sync):
+      {"name": "John Smith", "phone": "+1...", "email": "..."}
+
+    iOS Shortcuts contacts format:
+      {
+        "givenName": "John", "familyName": "Smith",
+        "phoneNumbers": [{"value": "+1..."}],
+        "emailAddresses": [{"value": "..."}]
+      }
+
+    iOS Shortcuts may also emit flat strings for phoneNumbers/emailAddresses
+    when there is only one entry, so we handle that too.
+    """
+    # ── Name ─────────────────────────────────────────────────────────────────
+    if raw.get("givenName") or raw.get("familyName"):
+        given = (raw.get("givenName") or "").strip()
+        family = (raw.get("familyName") or "").strip()
+        name = f"{given} {family}".strip()
+    else:
+        name = (raw.get("name") or raw.get("displayName") or "").strip()
+
+    # ── Phone ─────────────────────────────────────────────────────────────────
+    phone = None
+    phone_raw = raw.get("phoneNumbers") or raw.get("phone")
+    if isinstance(phone_raw, list) and phone_raw:
+        first = phone_raw[0]
+        phone = first.get("value") if isinstance(first, dict) else str(first)
+    elif isinstance(phone_raw, str):
+        phone = phone_raw
+    elif isinstance(phone_raw, dict):
+        phone = phone_raw.get("value")
+
+    # ── Email ─────────────────────────────────────────────────────────────────
+    email = None
+    email_raw = raw.get("emailAddresses") or raw.get("email")
+    if isinstance(email_raw, list) and email_raw:
+        first = email_raw[0]
+        email = first.get("value") if isinstance(first, dict) else str(first)
+    elif isinstance(email_raw, str):
+        email = email_raw
+    elif isinstance(email_raw, dict):
+        email = email_raw.get("value")
+
+    return name, phone or None, email or None
+
+
 @app.post("/contacts/sync")
 def contacts_sync(payload: ContactsSync):
     """
     Upsert contacts from Apple Contacts (via iOS Shortcut).
+    Accepts both simple {name, phone, email} and the iOS Shortcuts nested
+    format (givenName/familyName/phoneNumbers/emailAddresses).
     Matches on phone OR email. New contacts default to Normal tier.
     Existing contacts keep their current tier.
     Returns {"synced": N, "new": N, "updated": N}
     """
+    received = len(payload.contacts)
+    logger.info(f"[SYNC] Received {received} contacts from iOS Shortcut")
+
     new_count = 0
     updated_count = 0
+    skipped = 0
     conn = get_connection()
     cur = conn.cursor()
 
-    for item in payload.contacts:
-        name = (item.name or "").strip()
+    for raw in payload.contacts:
+        name, phone, email = _extract_contact_fields(raw)
+
         if not name:
+            skipped += 1
             continue
 
-        norm_phone = _normalize_phone(item.phone) if item.phone else None
-        norm_email = item.email.strip().lower() if item.email else None
+        norm_phone = _normalize_phone(phone) if phone else None
+        norm_email = email.strip().lower() if email else None
+
+        if not norm_phone and not norm_email:
+            # No phone or email — match by name only, skip if already exists
+            cur.execute("SELECT id FROM contacts WHERE name = ? COLLATE NOCASE", (name,))
+            if cur.fetchone():
+                updated_count += 1
+            else:
+                cur.execute("INSERT INTO contacts (name, tier) VALUES (?, 'normal')", (name,))
+                new_count += 1
+            continue
 
         # Try to find existing contact by phone or email
         existing = None
@@ -234,8 +299,11 @@ def contacts_sync(payload: ContactsSync):
     conn.commit()
     conn.close()
     total = new_count + updated_count
-    logger.info(f"[SYNC] Synced {total} contacts: {new_count} new, {updated_count} updated")
-    return {"synced": total, "new": new_count, "updated": updated_count}
+    logger.info(
+        f"[SYNC] Done — received={received} synced={total} new={new_count} "
+        f"updated={updated_count} skipped={skipped}"
+    )
+    return {"synced": total, "new": new_count, "updated": updated_count, "skipped": skipped}
 
 
 @app.post("/contacts/{contact_id}/tier")
