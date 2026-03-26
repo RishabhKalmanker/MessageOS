@@ -313,6 +313,68 @@ async def contacts_sync(request: Request):
     return {"synced": total, "new": new_count, "updated": updated_count, "skipped": skipped}
 
 
+@app.post("/contacts/sync-one")
+async def contacts_sync_one(request: Request):
+    """
+    Upsert a single contact. Accepts the same flexible format as /contacts/sync
+    so the iOS Shortcut can call this once per contact instead of batching.
+    Returns {"synced": 1, "new": 0|1, "updated": 0|1, "skipped": 0|1}
+    """
+    raw = await request.json()
+    logger.info(f"[SYNC-ONE] Received: {raw}")
+
+    name, phone, email = _extract_contact_fields(raw)
+
+    if not name:
+        logger.info("[SYNC-ONE] Skipped — no name")
+        return {"synced": 0, "new": 0, "updated": 0, "skipped": 1}
+
+    norm_phone = _normalize_phone(phone) if phone else None
+    norm_email = email.strip().lower() if email else None
+
+    conn = get_connection()
+    cur = conn.cursor()
+
+    existing = None
+    if norm_phone:
+        cur.execute("SELECT * FROM contacts WHERE phone = ?", (norm_phone,))
+        existing = cur.fetchone()
+    if not existing and norm_email:
+        cur.execute("SELECT * FROM contacts WHERE email = ?", (norm_email,))
+        existing = cur.fetchone()
+    if not existing and not norm_phone and not norm_email:
+        cur.execute("SELECT * FROM contacts WHERE name = ? COLLATE NOCASE", (name,))
+        existing = cur.fetchone()
+
+    if existing:
+        cur.execute(
+            """UPDATE contacts
+               SET name = ?,
+                   phone = COALESCE(phone, ?),
+                   email = COALESCE(email, ?)
+               WHERE id = ?""",
+            (name, norm_phone, norm_email, existing["id"]),
+        )
+        conn.commit()
+        conn.close()
+        logger.info(f"[SYNC-ONE] Updated: {name}")
+        return {"synced": 1, "new": 0, "updated": 1, "skipped": 0}
+    else:
+        try:
+            cur.execute(
+                "INSERT INTO contacts (name, phone, email, tier) VALUES (?, ?, ?, 'normal')",
+                (name, norm_phone, norm_email),
+            )
+            conn.commit()
+            conn.close()
+            logger.info(f"[SYNC-ONE] Created: {name}")
+            return {"synced": 1, "new": 1, "updated": 0, "skipped": 0}
+        except Exception as e:
+            conn.close()
+            logger.warning(f"[SYNC-ONE] Constraint error for {name}: {e}")
+            return {"synced": 1, "new": 0, "updated": 1, "skipped": 0}
+
+
 @app.post("/contacts/{contact_id}/tier")
 def set_contact_tier(contact_id: int, payload: dict):
     """Update a single contact's tier directly by ID (used by the web UI)."""
