@@ -135,6 +135,84 @@ def imessage_received(payload: IMessageReceived):
     return {"status": "ok", "contact": contact["name"], "tier": tier, "message_id": message_id}
 
 
+@app.post("/webhook/imessage-ping")
+def imessage_ping(payload: dict):
+    """
+    Called by iOS Shortcut automation 2 (no content filter — fires on every
+    message including single words and emoji). Only receives phone number.
+
+    Deduplication: if an open SLA clock already exists for this contact
+    started within the last 2 minutes we skip the alert — automation 1
+    (/webhook/imessage-received) likely already fired for the same message.
+    """
+    phone = (payload.get("phone") or "").strip()
+    if not phone:
+        return {"status": "ok", "action": "skipped", "reason": "no phone"}
+
+    from contacts import _normalize_phone
+    norm = _normalize_phone(phone)
+
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM contacts WHERE phone = ?", (norm,))
+    row = cur.fetchone()
+
+    if not row:
+        conn.close()
+        logger.info(f"[PING] Unknown number {norm} — logged only")
+        return {"status": "ok", "action": "skipped", "reason": "unknown contact"}
+
+    contact = dict(row)
+    tier = effective_tier(contact)
+    contact_id = contact["id"]
+    name = contact["name"]
+
+    if tier not in ("vip", "important"):
+        conn.close()
+        logger.info(f"[PING] {name} is {tier} — no alert")
+        return {"status": "ok", "action": "skipped", "reason": "normal tier"}
+
+    # Deduplication: open clock created in the last 2 minutes means
+    # automation 1 already handled this message.
+    cur.execute(
+        """SELECT id FROM sla_clocks
+           WHERE contact_id = ?
+             AND closed_at IS NULL
+             AND started_at >= datetime('now', '-2 minutes')""",
+        (contact_id,),
+    )
+    recent = cur.fetchone()
+    if recent:
+        conn.close()
+        logger.info(f"[PING] {name} — recent SLA clock exists (id={recent['id']}), skipping duplicate")
+        return {"status": "ok", "action": "skipped", "reason": "duplicate"}
+
+    # Insert a minimal message record so the SLA clock has a message_id
+    cur.execute(
+        """INSERT INTO messages (contact_id, source, direction, body, received_at, sla_tier, sla_started_at)
+           VALUES (?, 'imessage', 'inbound', '', datetime('now'), ?, datetime('now'))""",
+        (contact_id, tier),
+    )
+    conn.commit()
+    message_id = cur.lastrowid
+    conn.execute(
+        "UPDATE contacts SET last_contacted = datetime('now') WHERE id = ?", (contact_id,)
+    )
+    conn.commit()
+    conn.close()
+
+    open_sla_clock(message_id, contact_id)
+
+    if tier == "vip":
+        alert_vip_received(name, "Sent you a message", contact_id=contact_id, message_id=message_id)
+        logger.info(f"[PING] VIP {name} — SLA clock started, alert fired")
+    else:
+        alert_important_received(name, "Sent you a message", contact_id=contact_id, message_id=message_id)
+        logger.info(f"[PING] Important {name} — SLA clock started, alert fired")
+
+    return {"status": "ok", "action": "alerted", "contact": name, "tier": tier}
+
+
 @app.post("/webhook/imessage-sent")
 def imessage_sent(payload: IMessageSent):
     recipient = payload.recipient or "Unknown"
