@@ -293,7 +293,7 @@ def contacts_list():
     return [dict(r) for r in rows]
 
 
-def _extract_contact_fields(raw: dict) -> tuple[str, str | None, str | None]:
+def _extract_contact_fields(raw: dict) -> "tuple[str, Optional[str], Optional[str]]":
     """
     Return (name, phone, email) from either format:
 

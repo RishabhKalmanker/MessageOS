@@ -1,5 +1,6 @@
 import os
 import logging
+from typing import Optional
 from database import get_connection
 
 logger = logging.getLogger(__name__)
@@ -88,7 +89,7 @@ def get_or_create_contact(name: str, phone: str = None, email: str = None) -> di
     return contact
 
 
-def get_contact_by_id(contact_id: int) -> dict | None:
+def get_contact_by_id(contact_id: int) -> Optional[dict]:
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("SELECT * FROM contacts WHERE id = %s", (contact_id,))
