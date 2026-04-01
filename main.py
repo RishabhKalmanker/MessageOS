@@ -5,9 +5,11 @@ FastAPI backend for personal message intelligence.
 
 import os
 import logging
+import requests as _requests
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import List, Optional
+from apscheduler.schedulers.background import BackgroundScheduler
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -62,13 +64,32 @@ class TierUpdate(BaseModel):
 # App lifespan
 # ---------------------------------------------------------------------------
 
+RENDER_URL = os.getenv("RENDER_URL", "https://messageos.onrender.com")
+
+
+def _keepalive():
+    try:
+        r = _requests.get(f"{RENDER_URL}/ping", timeout=10)
+        logger.info(f"[KEEPALIVE] {r.status_code}")
+    except Exception as e:
+        logger.warning(f"[KEEPALIVE] Failed: {e}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("[STARTUP] Initializing MessageOS")
     init_db()
     watchdog_thread = start_watchdog()
+
+    scheduler = BackgroundScheduler()
+    scheduler.add_job(_keepalive, "interval", minutes=14, id="keepalive")
+    scheduler.start()
+    logger.info("[STARTUP] Keep-alive scheduler started (every 14 min)")
+
     yield
-    logger.info("[SHUTDOWN] Stopping SLA watchdog")
+
+    logger.info("[SHUTDOWN] Stopping scheduler and SLA watchdog")
+    scheduler.shutdown(wait=False)
     stop_watchdog()
     watchdog_thread.join(timeout=5)
 
@@ -83,6 +104,11 @@ app = FastAPI(title="MessageOS", version="1.1.0", lifespan=lifespan)
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.get("/ping")
+def ping():
+    return {"status": "ok", "timestamp": datetime.now(timezone.utc).isoformat()}
 
 
 # ---------------------------------------------------------------------------
