@@ -1,5 +1,4 @@
 import threading
-import time
 import logging
 from datetime import datetime, timezone
 from database import get_connection
@@ -10,31 +9,37 @@ logger = logging.getLogger(__name__)
 # SLA thresholds in minutes
 SLA_VIP_WARN_MINUTES = 18
 SLA_VIP_BREACH_MINUTES = 20
-SLA_IMPORTANT_WARN_MINUTES = 110   # warn at 110 min
-SLA_IMPORTANT_BREACH_MINUTES = 120  # breach at 2 hours
+SLA_IMPORTANT_WARN_MINUTES = 110
+SLA_IMPORTANT_BREACH_MINUTES = 120
 
 WATCHDOG_INTERVAL_SECONDS = 60
 
 _stop_event = threading.Event()
 
 
+def _to_aware(val) -> datetime:
+    """
+    Normalise a DB timestamp value to a timezone-aware UTC datetime.
+    psycopg2 returns TIMESTAMPTZ columns as aware datetime objects;
+    handle both that case and the legacy string case defensively.
+    """
+    if isinstance(val, datetime):
+        return val if val.tzinfo else val.replace(tzinfo=timezone.utc)
+    return datetime.fromisoformat(str(val)).replace(tzinfo=timezone.utc)
+
+
 def _elapsed_minutes(clock: dict) -> float:
     """
-    Calculate effective elapsed minutes, subtracting any accumulated paused duration.
+    Effective elapsed minutes, subtracting any accumulated paused duration.
     """
-    started = datetime.fromisoformat(clock["started_at"]).replace(tzinfo=timezone.utc)
     now = datetime.now(timezone.utc)
-    total_seconds = (now - started).total_seconds()
+    total_seconds = (now - _to_aware(clock["started_at"])).total_seconds()
 
-    paused_seconds = clock.get("paused_duration_seconds") or 0
-
-    # If currently paused, don't count time since paused_at
+    paused_seconds = float(clock.get("paused_duration_seconds") or 0)
     if clock.get("paused_at"):
-        paused_since = datetime.fromisoformat(clock["paused_at"]).replace(tzinfo=timezone.utc)
-        paused_seconds += (now - paused_since).total_seconds()
+        paused_seconds += (now - _to_aware(clock["paused_at"])).total_seconds()
 
-    effective_seconds = total_seconds - paused_seconds
-    return effective_seconds / 60
+    return (total_seconds - paused_seconds) / 60
 
 
 def open_sla_clock(message_id: int, contact_id: int) -> int:
@@ -42,12 +47,13 @@ def open_sla_clock(message_id: int, contact_id: int) -> int:
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
-        """INSERT INTO sla_clocks (message_id, contact_id, started_at)
-           VALUES (?, ?, datetime('now'))""",
+        """INSERT INTO sla_clocks (message_id, contact_id)
+           VALUES (%s, %s)
+           RETURNING id""",
         (message_id, contact_id),
     )
     conn.commit()
-    clock_id = cur.lastrowid
+    clock_id = cur.fetchone()["id"]
     conn.close()
     logger.info(f"[SLA] Opened clock id={clock_id} for message_id={message_id} contact_id={contact_id}")
     return clock_id
@@ -59,8 +65,8 @@ def close_sla_clocks_for_contact(contact_id: int):
     cur = conn.cursor()
     cur.execute(
         """UPDATE sla_clocks
-           SET closed_at = datetime('now')
-           WHERE contact_id = ? AND closed_at IS NULL""",
+           SET closed_at = NOW()
+           WHERE contact_id = %s AND closed_at IS NULL""",
         (contact_id,),
     )
     closed = cur.rowcount
@@ -73,8 +79,6 @@ def close_sla_clocks_for_contact(contact_id: int):
 def _watchdog_tick():
     conn = get_connection()
     cur = conn.cursor()
-
-    # Fetch all open (un-closed) SLA clocks with contact info
     cur.execute("""
         SELECT sc.*, c.name, c.tier, c.phone, c.email
         FROM sla_clocks sc
@@ -88,7 +92,6 @@ def _watchdog_tick():
         elapsed = _elapsed_minutes(clock)
         tier = (clock.get("tier") or "normal").lower()
 
-        # Determine thresholds based on tier
         if tier == "vip":
             warn_threshold = SLA_VIP_WARN_MINUTES
             breach_threshold = SLA_VIP_BREACH_MINUTES
@@ -96,12 +99,11 @@ def _watchdog_tick():
             warn_threshold = SLA_IMPORTANT_WARN_MINUTES
             breach_threshold = SLA_IMPORTANT_BREACH_MINUTES
         else:
-            continue  # Normal contacts: no SLA enforcement
+            continue
 
         name = clock["name"]
         clock_id = clock["id"]
 
-        # Fire escalation alert once when warn threshold is crossed
         if elapsed >= warn_threshold and not clock["escalation_sent"]:
             logger.info(f"[SLA] Escalation for {name} — {elapsed:.1f} min elapsed")
             alert_sla_escalation(
@@ -112,7 +114,6 @@ def _watchdog_tick():
             )
             _mark_escalation_sent(clock_id)
 
-        # Mark breached when breach threshold is crossed
         if elapsed >= breach_threshold and not clock["breached"]:
             logger.warning(f"[SLA] BREACH for {name} — {elapsed:.1f} min elapsed")
             _mark_breached(clock_id)
@@ -120,8 +121,9 @@ def _watchdog_tick():
 
 def _mark_escalation_sent(clock_id: int):
     conn = get_connection()
-    conn.execute(
-        "UPDATE sla_clocks SET escalation_sent = 1 WHERE id = ?", (clock_id,)
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE sla_clocks SET escalation_sent = TRUE WHERE id = %s", (clock_id,)
     )
     conn.commit()
     conn.close()
@@ -129,16 +131,13 @@ def _mark_escalation_sent(clock_id: int):
 
 def _mark_breached(clock_id: int):
     conn = get_connection()
-    conn.execute(
-        "UPDATE sla_clocks SET breached = 1 WHERE id = ?", (clock_id,)
-    )
-    # Also mark the linked message as breached
     cur = conn.cursor()
-    cur.execute("SELECT message_id FROM sla_clocks WHERE id = ?", (clock_id,))
+    cur.execute("UPDATE sla_clocks SET breached = TRUE WHERE id = %s", (clock_id,))
+    cur.execute("SELECT message_id FROM sla_clocks WHERE id = %s", (clock_id,))
     row = cur.fetchone()
     if row and row["message_id"]:
-        conn.execute(
-            "UPDATE messages SET sla_breached = 1 WHERE id = ?", (row["message_id"],)
+        cur.execute(
+            "UPDATE messages SET sla_breached = TRUE WHERE id = %s", (row["message_id"],)
         )
     conn.commit()
     conn.close()

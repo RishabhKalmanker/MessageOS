@@ -68,11 +68,21 @@ RENDER_URL = os.getenv("RENDER_URL", "https://messageos.onrender.com")
 
 
 def _keepalive():
+    # Keep Render service awake
     try:
         r = _requests.get(f"{RENDER_URL}/ping", timeout=10)
-        logger.info(f"[KEEPALIVE] {r.status_code}")
+        logger.info(f"[KEEPALIVE] Render ping: {r.status_code}")
     except Exception as e:
-        logger.warning(f"[KEEPALIVE] Failed: {e}")
+        logger.warning(f"[KEEPALIVE] Render ping failed: {e}")
+    # Keep Supabase from pausing due to inactivity
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT 1")
+        conn.close()
+        logger.info("[KEEPALIVE] Supabase ping: ok")
+    except Exception as e:
+        logger.warning(f"[KEEPALIVE] Supabase ping failed: {e}")
 
 
 @asynccontextmanager
@@ -128,7 +138,8 @@ def imessage_received(payload: IMessageReceived):
     cur.execute(
         """INSERT INTO messages
            (contact_id, source, direction, body, received_at, sla_tier, sla_started_at)
-           VALUES (?, 'imessage', 'inbound', ?, ?, ?, ?)""",
+           VALUES (%s, 'imessage', 'inbound', %s, %s, %s, %s)
+           RETURNING id""",
         (
             contact_id,
             payload.body or "",
@@ -138,9 +149,9 @@ def imessage_received(payload: IMessageReceived):
         ),
     )
     conn.commit()
-    message_id = cur.lastrowid
-    conn.execute(
-        "UPDATE contacts SET last_contacted = datetime('now') WHERE id = ?", (contact_id,)
+    message_id = cur.fetchone()["id"]
+    cur.execute(
+        "UPDATE contacts SET last_contacted = NOW() WHERE id = %s", (contact_id,)
     )
     conn.commit()
     conn.close()
@@ -180,7 +191,7 @@ def imessage_ping(payload: dict):
 
     conn = get_connection()
     cur = conn.cursor()
-    cur.execute("SELECT * FROM contacts WHERE phone = ?", (norm,))
+    cur.execute("SELECT * FROM contacts WHERE phone = %s", (norm,))
     row = cur.fetchone()
 
     if not row:
@@ -202,9 +213,9 @@ def imessage_ping(payload: dict):
     # automation 1 already handled this message.
     cur.execute(
         """SELECT id FROM sla_clocks
-           WHERE contact_id = ?
+           WHERE contact_id = %s
              AND closed_at IS NULL
-             AND started_at >= datetime('now', '-2 minutes')""",
+             AND started_at >= NOW() - INTERVAL '2 minutes'""",
         (contact_id,),
     )
     recent = cur.fetchone()
@@ -215,14 +226,15 @@ def imessage_ping(payload: dict):
 
     # Insert a minimal message record so the SLA clock has a message_id
     cur.execute(
-        """INSERT INTO messages (contact_id, source, direction, body, received_at, sla_tier, sla_started_at)
-           VALUES (?, 'imessage', 'inbound', '', datetime('now'), ?, datetime('now'))""",
+        """INSERT INTO messages (contact_id, source, direction, body, sla_tier)
+           VALUES (%s, 'imessage', 'inbound', '', %s)
+           RETURNING id""",
         (contact_id, tier),
     )
     conn.commit()
-    message_id = cur.lastrowid
-    conn.execute(
-        "UPDATE contacts SET last_contacted = datetime('now') WHERE id = ?", (contact_id,)
+    message_id = cur.fetchone()["id"]
+    cur.execute(
+        "UPDATE contacts SET last_contacted = NOW() WHERE id = %s", (contact_id,)
     )
     conn.commit()
     conn.close()
@@ -249,13 +261,13 @@ def imessage_sent(payload: IMessageSent):
     contact_id = contact["id"]
 
     conn = get_connection()
-    conn.execute(
-        """INSERT INTO messages (contact_id, source, direction, body, received_at)
-           VALUES (?, 'imessage', 'outbound', '', datetime('now'))""",
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO messages (contact_id, source, direction, body) VALUES (%s, 'imessage', 'outbound', '')",
         (contact_id,),
     )
-    conn.execute(
-        "UPDATE contacts SET last_contacted = datetime('now') WHERE id = ?", (contact_id,)
+    cur.execute(
+        "UPDATE contacts SET last_contacted = NOW() WHERE id = %s", (contact_id,)
     )
     conn.commit()
     conn.close()
@@ -272,9 +284,11 @@ def imessage_sent(payload: IMessageSent):
 def contacts_list():
     """Return all contacts as JSON — powers the contacts web UI."""
     conn = get_connection()
-    rows = conn.execute(
-        "SELECT id, name, phone, email, tier, health_score, reply_probability, last_contacted FROM contacts ORDER BY name COLLATE NOCASE"
-    ).fetchall()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id, name, phone, email, tier, health_score, reply_probability, last_contacted FROM contacts ORDER BY LOWER(name)"
+    )
+    rows = cur.fetchall()
     conn.close()
     return [dict(r) for r in rows]
 
@@ -367,44 +381,47 @@ async def contacts_sync(request: Request):
 
         if not norm_phone and not norm_email:
             # No phone or email — match by name only, skip if already exists
-            cur.execute("SELECT id FROM contacts WHERE name = ? COLLATE NOCASE", (name,))
+            cur.execute("SELECT id FROM contacts WHERE LOWER(name) = LOWER(%s)", (name,))
             if cur.fetchone():
                 updated_count += 1
             else:
-                cur.execute("INSERT INTO contacts (name, tier) VALUES (?, 'normal')", (name,))
+                cur.execute("INSERT INTO contacts (name, tier) VALUES (%s, 'normal')", (name,))
                 new_count += 1
             continue
 
         # Try to find existing contact by phone or email
         existing = None
         if norm_phone:
-            cur.execute("SELECT * FROM contacts WHERE phone = ?", (norm_phone,))
+            cur.execute("SELECT * FROM contacts WHERE phone = %s", (norm_phone,))
             existing = cur.fetchone()
         if not existing and norm_email:
-            cur.execute("SELECT * FROM contacts WHERE email = ?", (norm_email,))
+            cur.execute("SELECT * FROM contacts WHERE email = %s", (norm_email,))
             existing = cur.fetchone()
 
         if existing:
             # Update name and fill in any missing phone/email — preserve tier
             cur.execute(
                 """UPDATE contacts
-                   SET name = ?,
-                       phone = COALESCE(phone, ?),
-                       email = COALESCE(email, ?)
-                   WHERE id = ?""",
+                   SET name = %s,
+                       phone = COALESCE(phone, %s),
+                       email = COALESCE(email, %s)
+                   WHERE id = %s""",
                 (name, norm_phone, norm_email, existing["id"]),
             )
             updated_count += 1
         else:
-            # New contact — default tier normal
+            # New contact — use SAVEPOINT to handle rare unique constraint races
+            # without aborting the entire transaction (psycopg2 requirement).
             try:
+                cur.execute("SAVEPOINT contact_insert")
                 cur.execute(
-                    "INSERT INTO contacts (name, phone, email, tier) VALUES (?, ?, ?, 'normal')",
+                    "INSERT INTO contacts (name, phone, email, tier) VALUES (%s, %s, %s, 'normal')",
                     (name, norm_phone, norm_email),
                 )
+                cur.execute("RELEASE SAVEPOINT contact_insert")
                 new_count += 1
             except Exception:
-                # Unique constraint race — treat as updated
+                cur.execute("ROLLBACK TO SAVEPOINT contact_insert")
                 updated_count += 1
 
     conn.commit()
@@ -441,22 +458,22 @@ async def contacts_sync_one(request: Request):
 
     existing = None
     if norm_phone:
-        cur.execute("SELECT * FROM contacts WHERE phone = ?", (norm_phone,))
+        cur.execute("SELECT * FROM contacts WHERE phone = %s", (norm_phone,))
         existing = cur.fetchone()
     if not existing and norm_email:
-        cur.execute("SELECT * FROM contacts WHERE email = ?", (norm_email,))
+        cur.execute("SELECT * FROM contacts WHERE email = %s", (norm_email,))
         existing = cur.fetchone()
     if not existing and not norm_phone and not norm_email:
-        cur.execute("SELECT * FROM contacts WHERE name = ? COLLATE NOCASE", (name,))
+        cur.execute("SELECT * FROM contacts WHERE LOWER(name) = LOWER(%s)", (name,))
         existing = cur.fetchone()
 
     if existing:
         cur.execute(
             """UPDATE contacts
-               SET name = ?,
-                   phone = COALESCE(phone, ?),
-                   email = COALESCE(email, ?)
-               WHERE id = ?""",
+               SET name = %s,
+                   phone = COALESCE(phone, %s),
+                   email = COALESCE(email, %s)
+               WHERE id = %s""",
             (name, norm_phone, norm_email, existing["id"]),
         )
         conn.commit()
@@ -465,17 +482,21 @@ async def contacts_sync_one(request: Request):
         return {"synced": 1, "new": 0, "updated": 1, "skipped": 0}
     else:
         try:
+            cur.execute("SAVEPOINT sync_one_insert")
             cur.execute(
-                "INSERT INTO contacts (name, phone, email, tier) VALUES (?, ?, ?, 'normal')",
+                "INSERT INTO contacts (name, phone, email, tier) VALUES (%s, %s, %s, 'normal')",
                 (name, norm_phone, norm_email),
             )
+            cur.execute("RELEASE SAVEPOINT sync_one_insert")
             conn.commit()
             conn.close()
             logger.info(f"[SYNC-ONE] Created: {name}")
             return {"synced": 1, "new": 1, "updated": 0, "skipped": 0}
         except Exception as e:
+            cur.execute("ROLLBACK TO SAVEPOINT sync_one_insert")
+            conn.commit()
             conn.close()
-            logger.warning(f"[SYNC-ONE] Constraint error for {name}: {e}")
+            logger.warning(f"[SYNC-ONE] Constraint collision for {name}: {e}")
             return {"synced": 1, "new": 0, "updated": 1, "skipped": 0}
 
 
@@ -488,13 +509,13 @@ def set_contact_tier(contact_id: int, payload: dict):
 
     conn = get_connection()
     cur = conn.cursor()
-    cur.execute("SELECT id, name FROM contacts WHERE id = ?", (contact_id,))
+    cur.execute("SELECT id, name FROM contacts WHERE id = %s", (contact_id,))
     row = cur.fetchone()
     if not row:
         conn.close()
         raise HTTPException(status_code=404, detail="Contact not found")
 
-    conn.execute("UPDATE contacts SET tier = ? WHERE id = ?", (tier, contact_id))
+    cur.execute("UPDATE contacts SET tier = %s WHERE id = %s", (tier, contact_id))
     conn.commit()
     conn.close()
     logger.info(f"[TIER] {row['name']} -> {tier}")
@@ -514,7 +535,9 @@ def _fuzzy_find_contact(name_query: str):
     Returns (contact_row_dict, ambiguous_list) — exactly one will be non-None.
     """
     conn = get_connection()
-    rows = conn.execute("SELECT * FROM contacts").fetchall()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM contacts")
+    rows = cur.fetchall()
     conn.close()
 
     if not rows:
@@ -557,7 +580,8 @@ def siri_set_tier(payload: TierUpdate):
         return "Contact not found. Try a different name."
 
     conn = get_connection()
-    conn.execute("UPDATE contacts SET tier = ? WHERE id = ?", (tier, contact["id"]))
+    cur = conn.cursor()
+    cur.execute("UPDATE contacts SET tier = %s WHERE id = %s", (tier, contact["id"]))
     conn.commit()
     conn.close()
     logger.info(f"[SIRI] {contact['name']} -> {tier}")
@@ -587,9 +611,9 @@ def siri_get_tier(name: str = Query(...)):
 @app.get("/siri/vip", response_class=PlainTextResponse)
 def siri_list_vip():
     conn = get_connection()
-    rows = conn.execute(
-        "SELECT name FROM contacts WHERE tier = 'vip' ORDER BY name COLLATE NOCASE"
-    ).fetchall()
+    cur = conn.cursor()
+    cur.execute("SELECT name FROM contacts WHERE tier = 'vip' ORDER BY LOWER(name)")
+    rows = cur.fetchall()
     conn.close()
     if not rows:
         return "You have no VIP contacts."
@@ -599,9 +623,9 @@ def siri_list_vip():
 @app.get("/siri/important", response_class=PlainTextResponse)
 def siri_list_important():
     conn = get_connection()
-    rows = conn.execute(
-        "SELECT name FROM contacts WHERE tier = 'important' ORDER BY name COLLATE NOCASE"
-    ).fetchall()
+    cur = conn.cursor()
+    cur.execute("SELECT name FROM contacts WHERE tier = 'important' ORDER BY LOWER(name)")
+    rows = cur.fetchall()
     conn.close()
     if not rows:
         return "You have no Important contacts."
@@ -629,14 +653,15 @@ def log_call(payload: CallLog):
         contact = get_or_create_contact(name=payload.contact_name)
 
     conn = get_connection()
-    conn.execute(
-        "INSERT INTO call_logs (contact_id, vibe, followup_needed, note) VALUES (?, ?, ?, ?)",
-        (contact["id"], payload.vibe, 1 if payload.followup_needed else 0, payload.note),
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO call_logs (contact_id, vibe, followup_needed, note) VALUES (%s, %s, %s, %s)",
+        (contact["id"], payload.vibe, payload.followup_needed, payload.note),
     )
     if payload.followup_needed:
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        conn.execute(
-            "INSERT INTO commitments (contact_id, description) VALUES (?, ?)",
+        cur.execute(
+            "INSERT INTO commitments (contact_id, description) VALUES (%s, %s)",
             (contact["id"], f"Follow up after call on {today}"),
         )
     conn.commit()

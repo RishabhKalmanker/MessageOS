@@ -33,10 +33,7 @@ def _get_important_emails() -> set:
 
 
 def resolve_tier_from_env(phone: str = None, email: str = None) -> str:
-    """
-    Determine tier purely from environment variable lists.
-    Returns 'vip', 'important', or 'normal'.
-    """
+    """Determine tier purely from environment variable lists."""
     norm_phone = _normalize_phone(phone) if phone else ""
     norm_email = email.strip().lower() if email else ""
 
@@ -54,7 +51,6 @@ def resolve_tier_from_env(phone: str = None, email: str = None) -> str:
 def get_or_create_contact(name: str, phone: str = None, email: str = None) -> dict:
     """
     Look up contact by phone or email. If not found, create with name.
-    Tier is determined by env lists, then by existing DB tier.
     Returns contact row as dict.
     """
     conn = get_connection()
@@ -64,30 +60,28 @@ def get_or_create_contact(name: str, phone: str = None, email: str = None) -> di
 
     if phone:
         norm = _normalize_phone(phone)
-        cur.execute("SELECT * FROM contacts WHERE phone = ?", (norm,))
+        cur.execute("SELECT * FROM contacts WHERE phone = %s", (norm,))
         contact = cur.fetchone()
 
     if not contact and email:
-        cur.execute("SELECT * FROM contacts WHERE email = ?", (email.strip().lower(),))
+        cur.execute("SELECT * FROM contacts WHERE email = %s", (email.strip().lower(),))
         contact = cur.fetchone()
 
     if contact:
         conn.close()
         return dict(contact)
 
-    # Determine tier from env
     tier = resolve_tier_from_env(phone, email)
     norm_phone = _normalize_phone(phone) if phone else None
     norm_email = email.strip().lower() if email else None
 
     cur.execute(
         """INSERT INTO contacts (name, phone, email, tier)
-           VALUES (?, ?, ?, ?)""",
+           VALUES (%s, %s, %s, %s)
+           RETURNING *""",
         (name or "Unknown", norm_phone, norm_email, tier),
     )
     conn.commit()
-    contact_id = cur.lastrowid
-    cur.execute("SELECT * FROM contacts WHERE id = ?", (contact_id,))
     contact = dict(cur.fetchone())
     conn.close()
     logger.info(f"[CONTACTS] Created new contact: {contact['name']} (tier={tier})")
@@ -97,7 +91,7 @@ def get_or_create_contact(name: str, phone: str = None, email: str = None) -> di
 def get_contact_by_id(contact_id: int) -> dict | None:
     conn = get_connection()
     cur = conn.cursor()
-    cur.execute("SELECT * FROM contacts WHERE id = ?", (contact_id,))
+    cur.execute("SELECT * FROM contacts WHERE id = %s", (contact_id,))
     row = cur.fetchone()
     conn.close()
     return dict(row) if row else None
